@@ -20,7 +20,7 @@ use crate::user_info::UserInfo;
 use crate::VideoWrapper::{Telegram, TikTok};
 
 mod inst;
-// mod user_info;
+mod user_info;
 
 //#region Fields
 const token: &str = "6814456031:AAEubA5vlBdbbUAW35sOGh-YymjWszdq9Sk";
