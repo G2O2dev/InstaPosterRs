@@ -1,37 +1,51 @@
 use std::*;
-use std::cell::{RefCell, RefMut};
-use std::fmt::Display;
-use std::io::Read;
-use std::ops::Add;
-use std::rc::Rc;
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use anyhow::anyhow;
 use anyhow::Result;
-use chrono::*;
 use frankenstein::*;
-use frankenstein::AllowedUpdate::*;
-use reqwest::blocking::Client;
+use futures_util::StreamExt;
+use lazy_static::lazy_static;
+use reqwest;
+use reqwest::Client;
 use rusqlite::*;
-use rustc_serialize::json::Json;
+use tokio::sync::Mutex;
 
-use crate::user_info::UserInfo;
+use crate::contol_panel::UserControl;
+use crate::graph_api::fb::*;
+use crate::instagrapi::user::IgUser;
+use crate::page_info::PageInfo;
+use crate::PostType::{Post, Reels, Story};
+use crate::State::{AllToReels, AllToStory};
+use crate::tiktok_api::video::{get_video_api16, get_video_tiktokvm, VideoInfo};
+use crate::user_info::{UserInfo, UserType};
+use crate::util::get_post_count;
 use crate::VideoWrapper::{Telegram, TikTok};
 
-mod inst;
 mod user_info;
+mod page_info;
+mod util;
+mod graph_api;
+mod msg_handler;
+mod contol_panel;
+mod tiktok_api;
+mod instagrapi;
 
 //#region Fields
-const token: &str = "6814456031:AAEubA5vlBdbbUAW35sOGh-YymjWszdq9Sk";
 
-const story_schedule: [u32; 7] = [8, 10, 10, 5, 20, 20, 20];
-const reels_schedule: [u32; 7] = [4, 5, 3, 5, 6, 6, 6];
-const post_schedule: [u32; 7] = [4, 4, 4, 4, 4, 4, 4];
+lazy_static! {
+    pub static ref API: Api = Api::new(TOKEN);
+    pub static ref CLIENT: Client = Client::new();
+    pub static ref DB: Mutex<Connection> = Mutex::new(Connection::open(&[env::current_dir().unwrap(), "Posts.db".into()].iter().collect::<PathBuf>()).expect("Can't connect to database"));
+    pub static ref REELS_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub static ref STORY_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub static ref POST_COUNT: AtomicU32 = AtomicU32::new(0);
+}
 
-static mut reels_count: AtomicU32 = AtomicU32::new(0);
-static mut story_count: AtomicU32 = AtomicU32::new(0);
-static mut post_count: AtomicU32 = AtomicU32::new(0);
+
+pub const TOKEN: &str = "токен бота";
 
 
 #[derive(PartialEq)]
@@ -40,8 +54,12 @@ pub enum State {
     ReelsWaiting,
     StoryWaiting,
     PostWaiting,
+    AllToWaiting(i32),
     ChoiceWaiting(i32),
     Something(VideoWrapper, i32),
+    AllToReels,
+    AllToStory,
+    AllToPost,
 }
 
 #[derive(PartialEq)]
@@ -65,100 +83,174 @@ impl fmt::Display for PostType {
 
 //#endregion
 
-fn main() {
-    unsafe {
-        let api = Api::new(token);
+//#region Telegram API hellpers
 
-        let mut update_params = GetUpdatesParams::builder().allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::CallbackQuery]).build();
+fn make_markup(buttons: Vec<(&str, &str)>) -> InlineKeyboardMarkup {
+    let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    let mut row: Vec<InlineKeyboardButton> = Vec::new();
 
-        let post_db = Connection::open("E:\\Project\\InstaPoster\\Posts.db").expect("Can't connect to database");
+    for (text, callback) in buttons {
+        let btn = InlineKeyboardButton::builder().text(text).callback_data(callback).build();
+        row.push(btn);
+    }
+    keyboard.push(row);
+    InlineKeyboardMarkup { inline_keyboard: keyboard }
+}
 
-        // let pages = get_pages();
 
-        // upload_reel(&pages[0].0, &pages[0].1, "тест", "C:\\reels\\1.mp4");
+//#endregion
+pub fn handle_main_err<T>(res: Result<T, anyhow::Error>, uc: &UserControl, comment: &str) {
+    if let Err(err) = res {
+        let report = format!("An error has occurred\n{}\n{}\n{}", comment, err, err.backtrace());
+        println!("{}", &report);
+        uc.send_msg(&report, UserType::Admin);
+    }
+}
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut update_params = GetUpdatesParams::builder().allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::CallbackQuery]).build();
 
-        reels_count.store(post_db.query_row("SELECT Count(*) FROM Reels", [], |r| r.get(0)).unwrap(), Ordering::SeqCst);
-        story_count.store(post_db.query_row("SELECT Count(*) FROM Story", [], |r| r.get(0)).unwrap(), Ordering::SeqCst);
-        post_count.store(post_db.query_row("SELECT Count(*) FROM Post", [], |r| r.get(0)).unwrap(), Ordering::SeqCst);
+    REELS_COUNT.store(get_post_count(Reels).await, Ordering::SeqCst);
+    STORY_COUNT.store(get_post_count(Story).await, Ordering::SeqCst);
+    POST_COUNT.store(get_post_count(Post).await, Ordering::SeqCst);
 
-        let mut users: Vec<UserInfo> = Vec::new();
+    let mut users: UserControl = UserControl::new(vec![UserInfo::new(1737227326, UserType::Admin), UserInfo::new(6916374574, UserType::Admin)]);
+    let mut pages: Vec<PageInfo> = vec![
+        PageInfo::new("Magic 4ish".to_string(), "188202787709983".to_string(), [3, 3, 3, 3, 3, 4, 4], [7, 7, 7, 7, 7, 10, 10], [3, 3, 3, 3, 3, 3, 3]),
+        PageInfo::new("G2Mem".to_string(), "195652260295422".to_string(), [3, 2, 2, 2, 3, 4, 4], [5, 5, 5, 5, 5, 8, 8], [1, 1, 1, 1, 2, 2, 2]),
+    ];
+    handle_main_err(fill_page_info(&mut pages).await, &users, "Loading pages");
 
-        loop {
-            let result = api.get_updates(&update_params);
-            // println!("{:#?}", result);
+    loop {
+        let result = API.get_updates(&update_params);
 
-            match result {
-                Ok(resp) => {
-                    for update in resp.result {
-                        if let UpdateContent::Message(message) = update.content {
-                            handle_message(message, &mut users, &api, &post_db).unwrap();
-                            update_params.offset = Some(update.update_id as i64 + 1);
-                        } else if let UpdateContent::CallbackQuery(callback) = update.content {
-                            if let Err(_) = api.answer_callback_query(&AnswerCallbackQueryParams::builder().callback_query_id(&callback.id).build()) {
-                                continue;
-                            }
+        match result {
+            Ok(resp) => {
+                for update in resp.result {
+                    if let UpdateContent::Message(message) = update.content {
+                        handle_main_err(handle_message(message, &mut users, &pages).await, &users, "Message handling");
 
-                            handle_callback(callback, &mut users, &api, &post_db).unwrap();
-                            update_params.offset = Some(update.update_id as i64 + 1);
+                        update_params.offset = Some(update.update_id as i64 + 1);
+                    } else if let UpdateContent::CallbackQuery(callback) = update.content {
+                        if let Err(_) = API.answer_callback_query(&AnswerCallbackQueryParams::builder().callback_query_id(&callback.id).build()) {
+                            continue;
                         }
-                    }
-                }
 
-                Err(e) => {
-                    println!("{:#?}", e);
+                        handle_main_err(handle_callback(callback, &mut users).await, &users, "Callback handling");
+                        update_params.offset = Some(update.update_id as i64 + 1);
+                    }
                 }
             }
 
-            if false {
-                let date = get_closest_reels_date(&post_db);
+            Err(e) => println!("{:#?}", e)
+        }
+
+        for page in &mut *pages {
+            if let Some(post_type) = page.need_post_something().await {
+                match post_type {
+                    PostType::Reels => {
+                        if REELS_COUNT.load(Ordering::SeqCst) > 0 {
+                            handle_main_err(page.post_reels(&users).await, &users, "Reels uploading");
+                        }
+                    }
+                    PostType::Story => {
+                        if STORY_COUNT.load(Ordering::SeqCst) > 0 {
+                            handle_main_err(page.post_story(&users).await, &users, "Story uploading");
+                        }
+                    }
+                    PostType::Post => {
+                        // if POST_COUNT.load(Ordering::SeqCst) > 0 {
+                        //     page.post_post(&api, &users[0], &DB).await.unwrap();
+                        //     POST_COUNT.fetch_sub(1, Ordering::SeqCst);
+                        // }
+                    }
+                }
             }
         }
     }
 }
 
-fn get_user_index(chat_id: i64, users: &mut Vec<UserInfo>) -> usize {
-    return if let Some(u) = users.iter().position(|user| user.chat_id == chat_id) {
-        u
-    } else {
-        users.push(UserInfo::new(chat_id));
-        users.len() - 1
-    };
+async fn fill_page_info(pages: &mut Vec<PageInfo>) -> Result<()> {
+    for page in &mut *pages {
+        page.inst_id = get_ig_account(&page.page_id).await?;
+    }
+
+    let pages_id_token = get_pages().await?;
+    for id_token in pages_id_token {
+        for page in &mut *pages {
+            if page.page_id == id_token.0 {
+                page.page_token = id_token.1;
+                break;
+            }
+        }
+    }
+
+
+    Ok(())
 }
 
-fn handle_message(msg: frankenstein::Message, users: &mut Vec<UserInfo>, api: &Api, post_db: &Connection) -> Result<()> {
+async fn handle_message(msg: Message, users: &mut UserControl, pages: &Vec<PageInfo>) -> Result<()> {
     let chat_id = ChatId::Integer(msg.chat.id);
-    let index = get_user_index(msg.chat.id, users);
-    let mut user = &users[index];
+    let mut user = users.try_add_user(msg.chat.id);
 
-    let send_msg = |txt: &str| -> MethodResponse<frankenstein::Message> {
-        let msg = SendMessageParams::builder().chat_id(chat_id.clone()).text(txt).reply_markup(make_keyboard(vec!(("Рилс", "Reels"), ("История", "Story"), ("Отмена", "Cancel")))).build();
-        api.send_message(&msg).expect("error sending message")
+    let send_msg = |txt: &str| -> MethodResponse<Message> {
+        API.send_message(&SendMessageParams::builder().chat_id(chat_id.clone()).text(txt).reply_markup(ReplyMarkup::InlineKeyboardMarkup(make_markup(vec!(("Рилс", "Reels"), ("История", "Story"), ("Отмена", "Cancel"))))).build()).expect("error sending message")
     };
 
     if let Some(video) = msg.video {
         match user.state {
             State::ReelsWaiting => {
-                add_video(&Telegram(video), &user, PostType::Story, &post_db, &api).unwrap();
+                add_video(&Telegram(video), &user, PostType::Reels).await?;
 
-                user.set_state(State::Start);
+                user.state = State::Start;
             }
             State::StoryWaiting => {
-                add_video(&Telegram(video), &user, PostType::Story, &post_db, &api).unwrap();
+                add_video(&Telegram(video), &user, PostType::Story).await?;
 
-                user.set_state(State::Start);
+                user.state = State::Start;
             }
             State::PostWaiting => {}
+            State::AllToReels => {
+                add_video(&Telegram(video), &user, PostType::Reels).await?;
+            }
+            State::AllToStory => {
+                add_video(&Telegram(video), &user, PostType::Story).await?;
+            }
+            State::AllToPost => {}
             _ => {
                 if let State::Something(_, msg_id) = user.state {
-                    api.delete_message(&DeleteMessageParams::builder().chat_id(msg.chat.id).message_id(msg_id.clone()).build());
+                    user.delete_msg(msg_id.clone())?;
                 }
                 let resp = send_msg("Что это?");
 
-                user.set_state(State::Something(Telegram(video), resp.result.message_id));
+                user.state = State::Something(Telegram(video), resp.result.message_id);
             }
         }
     } else if let Some(text) = msg.text {
+        match text.as_ref() {
+            "/count" => {
+                user.send_msg(format!("У нас в копилке:\n\n{} - Рилсов\n{} - Сторис\n{} - Постов", REELS_COUNT.load(Ordering::SeqCst), STORY_COUNT.load(Ordering::SeqCst), POST_COUNT.load(Ordering::SeqCst)))?;
+                return Ok(());
+            }
+            "/all-to" => {
+                let resp = API.send_message(&SendMessageParams::builder().chat_id(chat_id.clone()).text("Режим All to\n\nВыбери в какую категорию мне загружать все видео которые ты будешь отпраавлять").reply_markup(ReplyMarkup::InlineKeyboardMarkup(make_markup(vec![("Reels", "OnlyReels"), ("Story", "OnlyStory")]))).build())?;
+                user.state = State::AllToWaiting(resp.result.message_id);
+                return Ok(());
+            }
+            "/post-time" => {
+                let mut resp = "Время ближайших постов:".to_string();
+
+                for page in pages {
+                    resp.push_str(&format!("\n\n{}:\nРилс - {}\nСторис - {}\nПост - {}", page.name, page.time_to_reels.format("%H:%M"), page.time_to_story.format("%H:%M"), page.time_to_post.format("%H:%M")));
+                }
+
+                user.send_msg(resp)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let valid_link = text.contains("tiktok.com");
 
         match user.state {
@@ -166,91 +258,129 @@ fn handle_message(msg: frankenstein::Message, users: &mut Vec<UserInfo>, api: &A
                 if valid_link {
                     let resp = send_msg("Что это?");
 
-                    user.set_state(State::Something(TikTok(text), resp.result.message_id));
+                    user.state = State::Something(TikTok(text), resp.result.message_id);
                 } else {
                     let resp = send_msg("Что ты хочешь добавить?");
 
-                    user.set_state(State::ChoiceWaiting(resp.result.message_id));
+                    user.state = State::ChoiceWaiting(resp.result.message_id);
                 }
             }
             State::ReelsWaiting => {
                 if valid_link {
-                    add_video(&TikTok(text), &user, PostType::Story, &post_db, &api).unwrap();
+                    add_video(&TikTok(text), &user, PostType::Reels).await?;
+                    user.state = State::Start;
                 }
             }
             State::StoryWaiting => {
                 if valid_link {
-                    add_video(&TikTok(text), &user, PostType::Story, &post_db, &api);
+                    add_video(&TikTok(text), &user, PostType::Story).await?;
+                    user.state = State::Start;
                 }
             }
             State::PostWaiting => {}
             State::Something(_, msg_id) => {
                 if valid_link {
-                    api.delete_message(&DeleteMessageParams::builder().chat_id(msg.chat.id).message_id(msg_id).build());
+                    user.delete_msg(msg_id)?;
 
                     let resp = send_msg("Что это?");
 
-                    user.set_state(State::Something(TikTok(text.clone()), resp.result.message_id));
+                    user.state = State::Something(TikTok(text.clone()), resp.result.message_id);
                 }
             }
             State::ChoiceWaiting(msg_id) => {
                 if valid_link {
-                    api.delete_message(&DeleteMessageParams::builder().chat_id(msg.chat.id).message_id(msg_id).build());
+                    user.delete_msg(msg_id)?;
 
                     let resp = send_msg("Что это?");
 
-                    user.set_state(State::Something(TikTok(text.clone()), resp.result.message_id));
+                    user.state = State::Something(TikTok(text.clone()), resp.result.message_id);
                 }
             }
+            State::AllToWaiting(msg_id) => {
+                user.delete_msg(msg_id)?;
+                if valid_link {
+                    let resp = send_msg("Что это?");
+
+                    user.state = State::Something(TikTok(text), resp.result.message_id);
+                } else {
+                    let resp = send_msg("Что ты хочешь добавить?");
+
+                    user.state = State::ChoiceWaiting(resp.result.message_id);
+                }
+            }
+            State::AllToReels => {
+                if valid_link {
+                    add_video(&TikTok(text), &user, PostType::Reels).await?;
+                }
+            }
+            State::AllToStory => {
+                if valid_link {
+                    add_video(&TikTok(text), &user, PostType::Story).await?;
+                }
+            }
+            State::AllToPost => {}
         }
     }
 
     Ok(())
 }
 
-fn handle_callback(callback: objects::CallbackQuery, users: &mut Vec<UserInfo>, api: &Api, post_db: &Connection) -> Result<()> {
-    let chat_id = callback.message.unwrap().chat.id;
-    let index = get_user_index(chat_id, users);
-    let mut user = &users[index];
+async fn handle_callback(callback: CallbackQuery, users: &mut UserControl) -> Result<()> {
+    let chat_id = match callback.message.unwrap() {
+        MaybeInaccessibleMessage::Message(m) => m.chat.id,
+        MaybeInaccessibleMessage::InaccessibleMessage(m) => m.chat.id
+    };
+    let mut user = users.try_add_user(chat_id);
 
     match callback.data.unwrap().as_ref() {
         "Reels" => {
             if let State::Something(video, msg_id) = &user.state {
-                api.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build());
-                add_video(video, &user, PostType::Reels, post_db, api)?;
+                API.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build());
+                add_video(video, &user, PostType::Reels).await?;
+                user.state = State::Start;
             } else if let State::ChoiceWaiting(choice_message_id) = user.state {
-                api.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду рилс, ты можешь отправить видео файл или ссылку на тикток.").build()).unwrap();
-                user.set_state(State::ReelsWaiting);
+                API.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду рилс, ты можешь отправить видео файл или ссылку на тикток.").build()).unwrap();
+                user.state = State::ReelsWaiting;
             }
         }
         "Story" => {
             if let State::Something(video, msg_id) = &user.state {
-                api.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build());
-                add_video(video, &user, PostType::Story, post_db, api)?;
+                API.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build())?;
+                add_video(video, &user, PostType::Story).await?;
+                user.state = State::Start;
             } else if let State::ChoiceWaiting(choice_message_id) = user.state {
-                api.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду историю, ты можешь отправить видео файл или ссылку на тикток.").build()).unwrap();
-                user.set_state(State::StoryWaiting);
+                API.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду историю, ты можешь отправить видео файл или ссылку на тикток.").build()).unwrap();
+                user.state = State::StoryWaiting;
             }
         }
         "Post" => {
             if let State::Something(video, msg_id) = &user.state {
-                api.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build());
-                add_video(video, &user, PostType::Post, post_db, api)?;
+                API.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id.clone()).build())?;
+                add_video(video, &user, PostType::Post).await?;
+                user.state = State::Start;
             } else if let State::ChoiceWaiting(choice_message_id) = user.state {
-                api.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду пост, ты можешь отправить видео/фото файл или ссылку на тикток.").build()).unwrap();
-                user.set_state(State::PostWaiting);
+                API.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(choice_message_id).text("Хорошо, жду пост, ты можешь отправить видео/фото файл или ссылку на тикток.").build()).unwrap();
+                user.state = State::PostWaiting;
             }
         }
         "Cancel" => {
-            let reset = |msg_id: i32| {
-                api.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(msg_id).build());
-                user.set_state(State::Start);
-            };
-
-            if let State::Something(_, msg_id) = user.state {
-                reset(msg_id);
-            } else if let State::ChoiceWaiting(msg_id) = user.state {
-                reset(msg_id);
+            if let State::Something(_, msg_id) = &user.state {
+                API.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(*msg_id).build());
+            } else if let State::ChoiceWaiting(msg_id) = &user.state {
+                API.delete_message(&DeleteMessageParams::builder().chat_id(chat_id).message_id(*msg_id).build());
+            }
+            user.state = State::Start;
+        }
+        "OnlyReels" => {
+            if let State::AllToWaiting(msg_id) = user.state {
+                API.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(msg_id).text("Хорошо, теперь всё что ты мне отправишь будет добавлено в Reels.").reply_markup(make_markup(vec![("Отменить", "Cancel")])).build())?;
+                user.state = AllToReels;
+            }
+        }
+        "OnlyStory" => {
+            if let State::AllToWaiting(msg_id) = user.state {
+                API.edit_message_text(&EditMessageTextParams::builder().chat_id(chat_id).message_id(msg_id).text("Хорошо, теперь всё что ты мне отправишь будет добавлено в Story.").reply_markup(make_markup(vec![("Отменить", "Cancel")])).build())?;
+                user.state = AllToStory;
             }
         }
         _ => {}
@@ -259,196 +389,98 @@ fn handle_callback(callback: objects::CallbackQuery, users: &mut Vec<UserInfo>, 
     Ok(())
 }
 
-fn make_keyboard(buttons: Vec<(&str, &str)>) -> ReplyMarkup {
-    let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    let mut row: Vec<InlineKeyboardButton> = Vec::new();
 
-    for (text, callback) in buttons {
-        let btn = InlineKeyboardButton::builder().text(text).callback_data(callback).build();
-        row.push(btn);
-    }
-
-    keyboard.push(row);
-    ReplyMarkup::InlineKeyboardMarkup(InlineKeyboardMarkup::builder().inline_keyboard(keyboard).build())
-}
-
-
-// In feature we can remove is_hd param and always process video
-fn get_video_link_and_id(video: &VideoWrapper, api: &Api) -> Result<(String, String, bool), > {
-    let mut is_hd = false;
-    let mut download_link;
-    let id;
-
+async fn get_video_link_and_id(video: &VideoWrapper) -> Result<VideoInfo> {
     match video {
         Telegram(video) => {
-            let file = api.get_file(&GetFileParams::builder().file_id(&video.file_id).build())?.result;
-            id = file.file_unique_id;
-            download_link = format!("https://api.telegram.org/file/bot{}/{}", token, file.file_path.unwrap());
+            let file = API.get_file(&GetFileParams::builder().file_id(&video.file_id).build())?.result;
 
-            if video.width >= 1080 || video.height >= 1920 {
-                is_hd = true;
-            }
+            return Ok(VideoInfo {
+                id: file.file_unique_id,
+                video_link: format!("https://api.telegram.org/file/bot{}/{}", TOKEN, file.file_path.unwrap()),
+                hd: video.width >= 1080 || video.height >= 1920,
+            });
         }
         TikTok(link) => {
-            let client = Client::new();
-
-            let url = format!("https://www.tikwm.com/api?url={}&count=12&cursor=0&web=1&hd=1", link);
-            let req = client.request(reqwest::Method::POST, url).send()?;
-
-            let json = Json::from_str(&req.text()?)?;
-            let data = json.find("data").unwrap();
-
-            id = data["id"].as_string().unwrap().to_owned();
-            download_link = "https://www.tikwm.com".to_owned();
-
-            if let Some(hd) = data.find("hdplay") {
-                download_link.push_str(&hd.as_string().unwrap());
-                is_hd = true;
+            if let Ok(vi) = get_video_tiktokvm(link).await {
+                return Ok(vi);
             } else {
-                download_link.push_str(&data["play"].as_string().unwrap());
+                return get_video_api16(link).await;
             }
         }
     }
-
-    Ok((download_link, id, is_hd))
 }
 
-fn download_video(download_link: &str, dist: &str) -> Result<()> {
-    let res = reqwest::blocking::get(download_link)?;
-    fs::write(dist, res.bytes()?)?;
+async fn download_file(download_link: &str, dist: &str) -> Result<()> {
+    let mut file = fs::File::create(dist)?;
+
+    println!("Start downloading {download_link} {dist}");
+    let res = reqwest::get(download_link).await?;
+
+    let mut stream = res.bytes_stream();
+    while let Some(item) = stream.next().await {
+        let bytes = item?;
+        file.write_all(&bytes)?;
+    }
 
     Ok(())
 }
 
 fn upscale_video(path: &str, dist: &str) -> Result<()> {
-    process::Command::new("E:\\Project\\InstaPosterF\\ffmpeg.exe").args(vec![
-        "-i", path, "-i", "E:\\Project\\InstaPosterF\\Watermark.png", "-filter_complex", "[0:v][1:v]overlay=main_w-overlay_w-30:main_h-overlay_h-30", "-s", "1080x1920", "-c:a", "copy", dist, "-y",
+    let mut wm_ath = env::current_dir()?;
+    wm_ath.push("Watermark.png");
+    process::Command::new("ffmpeg").args(vec![
+        "-i", path, "-i", &wm_ath.display().to_string(), "-filter_complex", "[0:v][1:v]overlay=main_w-overlay_w-30:main_h-overlay_h-30", "-s", "1080x1920", "-c:a", "copy", dist, "-y",
     ]).spawn()?.wait();
 
     Ok(())
 }
 
-fn add_video(video: &VideoWrapper, user: &UserInfo, post_type: PostType, post_db: &Connection, api: &Api) -> Result<()> {
-    let msg = SendMessageParams::builder().chat_id(user.chat_id).text("Добовляю рилс...").build();
-    let resp = api.send_message(&msg)?;
+async fn add_video(video: &VideoWrapper, user: &UserInfo, post_type: PostType) -> Result<()> {
+    let msg_id = user.send_msg("Добовляю...")?.result.message_id;
 
-
-    let mut right_counter: &AtomicU32 = unsafe {
+    let right_counter: &AtomicU32 = unsafe {
         match post_type {
-            PostType::Reels => &reels_count,
-            PostType::Story => &story_count,
-            PostType::Post => &post_count,
+            PostType::Reels => &REELS_COUNT,
+            PostType::Story => &STORY_COUNT,
+            PostType::Post => &POST_COUNT,
         }
     };
     let right_word: String = post_type.to_string();
 
-    let link_id_hd = get_video_link_and_id(video, &api)?;
+    user.edit_msg(msg_id, "Получаю данные о видео...");
+    let video_info = get_video_link_and_id(video).await?;
 
 
-    let is_unique: u32 = post_db.query_row(&format!("SELECT count(Id) FROM {} WHERE UniqueId={}", right_word, link_id_hd.1), [], |r| r.get(0)).unwrap();
+    let is_unique: u32 = DB.lock().await.query_row(&format!("SELECT count(Id) FROM {} WHERE UniqueId=\"{}\"", right_word, video_info.id), [], |r| r.get(0)).unwrap();
     if is_unique > 0 {
-        api.edit_message_text(&EditMessageTextParams::builder().chat_id(user.chat_id).message_id(resp.result.message_id).text("Это видео уже есть в списке").build())?;
+        user.edit_msg(msg_id, "Это видео уже есть в списке");
 
         return Ok(());
     }
 
+    user.edit_msg(msg_id, "Скачиваю видео...");
+    let mut dist = env::current_dir().unwrap();
+    dist.push(&right_word);
+    dist.push(format!("{}.mp4", &video_info.id));
 
-    let mut dist = format!("C:\\{}\\{}.mp4", right_word, right_counter.load(Ordering::SeqCst));
-    if link_id_hd.2 {
-        download_video(&link_id_hd.0, &dist);
+    if video_info.hd {
+        download_file(&video_info.video_link, &dist.display().to_string()).await?;
     } else {
-        let mut temp_dist = dist.to_owned();
-        temp_dist.push_str("tmp");
+        let temp_dist = format!("{}tmp", &dist.display().to_string());
 
-        download_video(&link_id_hd.0, &temp_dist);
-        upscale_video(&temp_dist, &dist);
+        download_file(&video_info.video_link, &temp_dist).await?;
+
+        user.edit_msg(msg_id, "Видео плохого качества, улучшаю...");
+        upscale_video(&temp_dist, &dist.display().to_string())?;
         fs::remove_file(&temp_dist);
     }
 
     right_counter.fetch_add(1, Ordering::AcqRel);
-    user.set_state(State::Start);
 
-    post_db.execute("INSERT INTO Reels (UniqueId) VALUES (?1)", [&link_id_hd.1])?;
+    DB.lock().await.execute(&format!("INSERT INTO {} (UniqueId) VALUES (?1)", &right_word), [&video_info.id])?;
 
-    api.edit_message_text(&EditMessageTextParams::builder().chat_id(user.chat_id).message_id(resp.result.message_id).text(format!("Рилс добавлен, в копилке уже {} {}", right_counter.load(Ordering::SeqCst), right_word)).build())?;
+    user.edit_msg(msg_id, &format!("Добавил, в копилке уже {} {}", right_counter.load(Ordering::SeqCst), right_word));
 
     Ok(())
-}
-
-fn get_closest_story_date(post_db: &Connection) -> DateTime<Utc> {
-    unsafe {
-        let now = Utc::now();
-        const start_posting: i64 = 8;
-        const end_posting: i64 = 22;
-
-        let stories_count: i64 = post_db.query_row("SELECT Count(*) FROM Stories", [], |r| r.get(0)).unwrap();
-
-        if stories_count == 0 {
-            let interval = Duration::hours(end_posting - start_posting) / story_schedule[now.weekday().num_days_from_monday() as usize] as i32;
-
-            let mut new_time = now.with_hour(start_posting as u32).unwrap().with_minute(0).unwrap().with_second(0).unwrap();
-
-            while new_time <= now {
-                new_time += interval;
-
-                let hour = new_time.hour();
-                if hour > end_posting as u32 || hour < start_posting as u32 || (hour == end_posting as u32 && new_time.minute() > 0) {
-                    return now.add(Duration::days(1)).with_hour(start_posting as u32).unwrap().with_minute(0).unwrap().with_second(0).unwrap();
-                }
-            }
-
-            new_time
-        } else {
-            let timestamp: i64 = post_db.query_row("SELECT PostTime FROM Stories ORDER BY Id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-            let last_story_time = DateTime::from_naive_utc_and_offset(NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap(), Utc);
-
-            let interval = Duration::hours(end_posting - start_posting) / story_schedule[last_story_time.weekday().num_days_from_monday() as usize] as i32;
-
-            let new_time = last_story_time + interval;
-            let hour = new_time.hour();
-            if hour > end_posting as u32 || hour < start_posting as u32 || (hour == end_posting as u32 && new_time.minute() > 0) {
-                return last_story_time.add(Duration::days(1)).with_hour(start_posting as u32).unwrap().with_minute(0).unwrap();
-            }
-
-            last_story_time + interval
-        }
-    }
-}
-
-fn get_closest_reels_date(post_db: &Connection) -> DateTime<Utc> {
-    unsafe {
-        let now = Utc::now();
-        const start_posting: i64 = 8;
-        const end_posting: i64 = 22;
-
-        if reels_count.load(Ordering::SeqCst) == 0 {
-            let interval = Duration::hours(end_posting - start_posting) / reels_schedule[now.weekday().num_days_from_monday() as usize] as i32;
-
-            let mut new_time = now.with_hour(start_posting as u32).unwrap().with_minute(0).unwrap().with_second(0).unwrap();
-
-            while new_time <= now {
-                new_time += interval;
-
-                let hour = new_time.hour();
-                if hour > end_posting as u32 || hour < start_posting as u32 || (hour == end_posting as u32 && new_time.minute() > 0) {
-                    return now.add(Duration::days(1)).with_hour(start_posting as u32).unwrap().with_minute(0).unwrap();
-                }
-            }
-
-            new_time
-        } else {
-            let timestamp: i64 = post_db.query_row("SELECT PostTime FROM Reels ORDER BY Id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-            let last_reels_time = DateTime::from_naive_utc_and_offset(NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap(), Utc);
-
-            let interval = Duration::hours(end_posting - start_posting) / reels_schedule[last_reels_time.weekday().num_days_from_monday() as usize] as i32;
-
-            let new_time = last_reels_time + interval;
-            let hour = new_time.hour();
-            if hour > end_posting as u32 || hour < start_posting as u32 || (hour == end_posting as u32 && new_time.minute() > 20) {
-                return last_reels_time.add(Duration::days(1)).with_hour(start_posting as u32).unwrap().with_minute(0).unwrap().with_second(0).unwrap();
-            }
-
-            last_reels_time + interval
-        }
-    }
 }
